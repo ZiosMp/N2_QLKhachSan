@@ -2,25 +2,47 @@
 invoice_service.py
 Các hàm nghiệp vụ cho module Invoices (Hóa đơn / Thanh toán)
 
-Bảng invoices (theo hotel_management.sql):
-    id, booking_id (UNIQUE), amount, created_at, status(Unpaid/Paid/Cancelled),
-    payment_method(Cash/BankTransfer)
+Bảng invoices (theo hotel_management.sql + migrate_add_service_fee.sql):
+    id, booking_id, amount, service_fee, created_at,
+    status(Unpaid/Paid/Cancelled), payment_method(Cash/BankTransfer)
+
+QUY TẮC QUAN TRỌNG:
+- Khi hóa đơn còn "Unpaid": Tổng tiền KHÔNG lấy từ cột amount đã lưu, mà luôn
+  tính lại "sống" (live) theo giá phòng HIỆN TẠI của booking (r.price) + phí
+  quá giờ hiện tại (b.extra_fee) + phí dịch vụ (i.service_fee). Nhờ vậy nếu
+  bên Booking đổi phòng (đổi room_id -> giá khác), hóa đơn tự cập nhật theo,
+  không cần đồng bộ thủ công.
+- Khi hóa đơn đã "Paid" hoặc "Cancelled": dùng đúng số tiền đã lưu cứng trong
+  cột amount tại thời điểm chuyển trạng thái - KHÔNG tính lại nữa (chốt sổ).
+- update_invoice() sẽ TỪ CHỐI mọi thay đổi nếu hóa đơn hiện đang ở trạng thái
+  "Paid" - hóa đơn đã thanh toán thì không thể sửa lại dưới bất kỳ hình thức
+  nào (kể cả gọi thẳng hàm này, không chỉ chặn ở giao diện).
 """
-from datetime import date
 import sys
 import os
 
-BASE_DIR = os.path.dirname(
-    os.path.dirname(
-        os.path.dirname(
-            os.path.abspath(__file__)
-        )
-    )
+BASE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
 )
 
 if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+    sys.path.insert(0, BASE_DIR)
+
 from db import get_connection
+
+
+# Biểu thức SQL dùng chung: tính lại tổng tiền "sống" theo giá phòng hiện tại.
+# GREATEST(DATEDIFF(...), 1) tương đương calc_nights() bên Python (tối thiểu 1 đêm).
+_LIVE_AMOUNT_SQL = """
+    (r.price * GREATEST(DATEDIFF(b.checkout_date, b.checkin_date), 1)
+     + IFNULL(b.extra_fee, 0) + IFNULL(i.service_fee, 0))
+"""
+
+# Khi hóa đơn đã Paid/Cancelled thì dùng số đã chốt (i.amount), không tính lại.
+_RESOLVED_AMOUNT_SQL = f"""
+    (CASE WHEN i.status = 'Unpaid' THEN {_LIVE_AMOUNT_SQL} ELSE i.amount END)
+"""
+
 
 # ---------------------------------------------------------------------
 # 1. Lấy danh sách booking CHƯA có hóa đơn -> đổ vào combobox "Booking"
@@ -37,7 +59,8 @@ def get_bookings_without_invoice():
         SELECT b.id AS booking_id, c.name AS customer_name,
                r.room_number, r.room_type, r.price,
                b.checkin_date, b.checkout_date,
-               b.actual_checkin, b.actual_checkout, b.status
+               b.actual_checkin, b.actual_checkout, b.status,
+               b.extended_hours, b.extra_fee AS late_fee
         FROM bookings b
         JOIN customers c ON b.customer_id = c.id
         JOIN rooms r ON b.room_id = r.id
@@ -60,7 +83,8 @@ def get_booking_detail(booking_id):
     sql = """
         SELECT b.id AS booking_id, c.name AS customer_name,
                r.room_number, r.room_type, r.price,
-               b.checkin_date, b.checkout_date
+               b.checkin_date, b.checkout_date,
+               b.extended_hours, b.extra_fee AS late_fee
         FROM bookings b
         JOIN customers c ON b.customer_id = c.id
         JOIN rooms r ON b.room_id = r.id
@@ -79,26 +103,41 @@ def calc_nights(checkin_date, checkout_date):
     return max(nights, 1)
 
 
-def calc_total(room_price, nights, extra_fee):
-    return float(room_price) * nights + float(extra_fee)
+def calc_total(room_price, nights, late_fee, service_fee=0):
+    """Tổng tiền = đơn giá phòng x số đêm + phí quá giờ + phí dịch vụ."""
+    return float(room_price) * nights + float(late_fee) + float(service_fee)
+
+
+def get_invoice_status(invoice_id):
+    """Lấy nhanh trạng thái hiện tại của 1 hóa đơn (dùng để kiểm tra khóa)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM invoices WHERE id = %s", (invoice_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------------
-# 2. CREATE - Tạo hóa đơn mới (nút "Create")
+# 2. CREATE - Tạo hóa đơn mới (nút "Tạo hóa đơn")
 # ---------------------------------------------------------------------
-def create_invoice(booking_id, amount, payment_method, status="Unpaid"):
+def create_invoice(booking_id, amount, payment_method, status="Unpaid", service_fee=0):
     """
-    Thêm 1 hóa đơn mới. Vì booking_id là UNIQUE trong bảng invoices,
-    nếu booking đã có hóa đơn sẽ báo lỗi -> bắt IntegrityError.
+    Thêm 1 hóa đơn mới cho booking.
+    Lưu ý: amount truyền vào chỉ có ý nghĩa "chốt cứng" nếu status="Paid" ngay
+    lúc tạo; nếu tạo với status="Unpaid" thì amount hiển thị ở các lần đọc sau
+    vẫn sẽ được tính lại sống theo _RESOLVED_AMOUNT_SQL, không phụ thuộc giá
+    trị lưu ở đây.
     """
     conn = get_connection()
     cur = conn.cursor()
     try:
         sql = """
-            INSERT INTO invoices (booking_id, amount, status, payment_method)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO invoices (booking_id, amount, service_fee, status, payment_method)
+            VALUES (%s, %s, %s, %s, %s)
         """
-        cur.execute(sql, (booking_id, amount, status, payment_method))
+        cur.execute(sql, (booking_id, amount, service_fee, status, payment_method))
         conn.commit()
         return cur.lastrowid
     except Exception as e:
@@ -110,14 +149,32 @@ def create_invoice(booking_id, amount, payment_method, status="Unpaid"):
 
 
 # ---------------------------------------------------------------------
-# 3. UPDATE - Cập nhật hóa đơn (nút "Update"), ví dụ đổi trạng thái
-#    thành "Paid" khi khách thanh toán, hoặc đổi phương thức thanh toán
+# 3. UPDATE - Cập nhật hóa đơn (nút "Cập nhật")
+#    - Chặn cứng: nếu hóa đơn đang ở trạng thái "Paid" thì KHÔNG cho sửa nữa.
+#    - Khi đổi status sang "Paid": amount truyền vào (đã tính theo giá phòng
+#      hiện tại ngay tại thời điểm bấm Cập nhật) sẽ được chốt cứng vào DB.
 # ---------------------------------------------------------------------
-def update_invoice(invoice_id, amount=None, status=None, payment_method=None):
+class InvoiceLockedError(Exception):
+    """Hóa đơn đã Paid, không được phép sửa nữa."""
+    pass
+
+
+def update_invoice(invoice_id, amount=None, status=None, payment_method=None, service_fee=None):
+    current_status = get_invoice_status(invoice_id)
+    if current_status is None:
+        raise ValueError("Không tìm thấy hóa đơn.")
+    if current_status == "Paid":
+        raise InvoiceLockedError(
+            "Hóa đơn này đã ở trạng thái Đã thanh toán nên không thể chỉnh sửa nữa."
+        )
+
     fields, values = [], []
     if amount is not None:
         fields.append("amount = %s")
         values.append(amount)
+    if service_fee is not None:
+        fields.append("service_fee = %s")
+        values.append(service_fee)
     if status is not None:
         fields.append("status = %s")
         values.append(status)
@@ -143,9 +200,12 @@ def update_invoice(invoice_id, amount=None, status=None, payment_method=None):
         conn.close()
 
 
-def mark_as_paid(invoice_id, payment_method):
-    """Tiện ích riêng cho nút thanh toán nhanh: đánh dấu Paid."""
-    update_invoice(invoice_id, status="Paid", payment_method=payment_method)
+def mark_as_paid(invoice_id, payment_method, amount):
+    """
+    Tiện ích chốt thanh toán: LUÔN truyền amount = tổng tiền đang hiển thị
+    (đã tính theo giá phòng hiện tại) để chốt cứng đúng số tại thời điểm này.
+    """
+    update_invoice(invoice_id, amount=amount, status="Paid", payment_method=payment_method)
 
 
 def cancel_invoice(invoice_id):
@@ -158,10 +218,10 @@ def cancel_invoice(invoice_id):
 def get_invoices(status_filter=None, payment_filter=None):
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    sql = """
+    sql = f"""
         SELECT i.id, i.booking_id, c.name AS customer_name,
-               r.room_number, i.amount, i.status, i.payment_method,
-               i.created_at
+               r.room_number, {_RESOLVED_AMOUNT_SQL} AS amount,
+               i.service_fee, i.status, i.payment_method, i.created_at
         FROM invoices i
         JOIN bookings b ON i.booking_id = b.id
         JOIN customers c ON b.customer_id = c.id
@@ -185,14 +245,20 @@ def get_invoices(status_filter=None, payment_filter=None):
 
 
 def get_invoice_full(invoice_id):
-    """Lấy đầy đủ thông tin hóa đơn (dùng để xuất PDF/Excel)."""
+    """
+    Lấy đầy đủ thông tin hóa đơn (dùng để hiển thị form / xuất PDF).
+    'amount' trả về đã được tính đúng: sống theo giá phòng hiện tại nếu còn
+    Unpaid, hoặc số đã chốt cứng nếu đã Paid/Cancelled.
+    """
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    sql = """
-        SELECT i.id, i.booking_id, i.amount, i.status, i.payment_method,
+    sql = f"""
+        SELECT i.id, i.booking_id, {_RESOLVED_AMOUNT_SQL} AS amount,
+               i.service_fee, i.status, i.payment_method,
                i.created_at, c.name AS customer_name, c.phone, c.email,
                r.room_number, r.room_type, r.price,
-               b.checkin_date, b.checkout_date
+               b.checkin_date, b.checkout_date,
+               b.extended_hours, b.extra_fee AS late_fee
         FROM invoices i
         JOIN bookings b ON i.booking_id = b.id
         JOIN customers c ON b.customer_id = c.id
@@ -207,7 +273,7 @@ def get_invoice_full(invoice_id):
 
 
 # ---------------------------------------------------------------------
-# 5. EXPORT - Xuất hóa đơn ra PDF (nút "Export")
+# 5. EXPORT - Xuất hóa đơn ra PDF (nút "Xuất PDF")
 # ---------------------------------------------------------------------
 def export_invoice_pdf(invoice_id, output_path=None):
     """
@@ -243,8 +309,11 @@ def export_invoice_pdf(invoice_id, output_path=None):
         f"Check-in         : {inv['checkin_date']}",
         f"Check-out        : {inv['checkout_date']}",
         f"Room price/night : {inv['price']:,.0f}",
+        f"Extended hours   : {inv.get('extended_hours') or 0}",
+        f"Late fee         : {float(inv.get('late_fee') or 0):,.0f}",
+        f"Service fee      : {float(inv.get('service_fee') or 0):,.0f}",
         "-" * 40,
-        f"Total amount     : {inv['amount']:,.0f}",
+        f"Total amount     : {float(inv['amount']):,.0f}",
         f"Status           : {inv['status']}",
         f"Payment method   : {inv['payment_method']}",
         f"Created at       : {inv['created_at']}",
