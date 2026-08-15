@@ -16,13 +16,22 @@ if BASE_DIR not in sys.path:
 from db import get_connection
 
 
+# Subquery tổng tiền dịch vụ/vật tư của 1 booking - lấy trực tiếp từ
+# booking_supplies + supplies (giống hệt invoice_service.py).
+_SERVICE_FEE_SQL = """
+    (SELECT COALESCE(SUM(bs.quantity * s.price), 0)
+     FROM booking_supplies bs
+     JOIN supplies s ON bs.supply_id = s.id
+     WHERE bs.booking_id = b.id)
+"""
+
 # Biểu thức SQL dùng chung với invoice_service.py: hóa đơn còn Unpaid thì tính
 # "sống" theo giá phòng hiện tại + phí quá giờ + phí dịch vụ; Paid/Cancelled
 # thì dùng số đã chốt cứng trong i.amount.
-_RESOLVED_AMOUNT_SQL = """
+_RESOLVED_AMOUNT_SQL = f"""
     (CASE WHEN i.status = 'Unpaid'
           THEN (r.price * GREATEST(DATEDIFF(b.checkout_date, b.checkin_date), 1)
-                + IFNULL(b.extra_fee, 0) + IFNULL(i.service_fee, 0))
+                + IFNULL(b.extra_fee, 0) + {_SERVICE_FEE_SQL})
           ELSE i.amount END)
 """
 
