@@ -87,11 +87,6 @@ CREATE TABLE IF NOT EXISTS consultation_requests (
 );
 USE ql_khachsan;
 
-ALTER TABLE bookings
-    ADD COLUMN room_number VARCHAR(10) NOT NULL DEFAULT '' AFTER room_price,
-    ADD COLUMN room_type ENUM('Standard','Deluxe','Suite') NOT NULL DEFAULT 'Standard' AFTER room_number,
-    ADD COLUMN room_image_url VARCHAR(255) AFTER room_type;
-
 SET SQL_SAFE_UPDATES = 0;
 
 UPDATE bookings b
@@ -102,7 +97,3 @@ SET b.room_number = r.room_number,
 WHERE b.room_number = '';
 
 SET SQL_SAFE_UPDATES = 1;
-
-
-
-
