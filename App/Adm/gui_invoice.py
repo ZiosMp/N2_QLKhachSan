@@ -215,12 +215,11 @@ class InvoiceFrame(tk.Frame):
         self.var_late_fee = tk.StringVar(value="0")
         self._entry_style(frm, self.var_late_fee, readonly=True).grid(row=7, column=1, sticky="w", pady=5)
 
-        # Phí dịch vụ - NHẬP TAY (minibar, giặt ủi, ăn uống thêm...)
+        # Phí dịch vụ - LẤY TRỰC TIẾP từ booking_supplies (quản lý bên Booking)
         self._field_label(frm, "Phí dịch vụ:").grid(row=8, column=0, sticky="e", pady=5, padx=(0, 8))
         self.var_service = tk.StringVar(value="0")
-        self.entry_service = self._entry_style(frm, self.var_service, readonly=False)
+        self.entry_service = self._entry_style(frm, self.var_service, readonly=True)
         self.entry_service.grid(row=8, column=1, sticky="w", pady=5)
-        self.entry_service.bind("<KeyRelease>", lambda e: self.recalc_total())
 
         # Tổng tiền (tự tính, luôn tính lại theo giá phòng hiện tại nếu còn Unpaid)
         self._field_label(frm, "Tổng tiền:").grid(row=9, column=0, sticky="e", pady=5, padx=(0, 8))
@@ -276,7 +275,7 @@ class InvoiceFrame(tk.Frame):
             self.lbl_lock_banner.grid_forget()
             self.cbo_status.configure(state="readonly")
             self.cbo_payment.configure(state="readonly")
-            self.entry_service.configure(state="normal")
+            self.entry_service.configure(state="readonly")
             self.btn_update.configure(style="Update.TButton")
 
     # -------------------------------------------------------------
@@ -359,7 +358,7 @@ class InvoiceFrame(tk.Frame):
         self.var_checkout.set(str(b["checkout_date"]))
         self.var_price.set(str(b["price"]))
         self.var_late_fee.set(str(b.get("late_fee") or 0))
-        self.var_service.set("0")  # hóa đơn mới -> phí dịch vụ mặc định 0, nhân viên tự nhập
+        self.var_service.set(str(b.get("service_fee") or 0))  # lấy từ booking_supplies
         self.recalc_total()
 
     def recalc_total(self):
@@ -368,10 +367,7 @@ class InvoiceFrame(tk.Frame):
         if not b:
             return
         late_fee = float(b.get("late_fee") or 0)
-        try:
-            service_fee = float(self.var_service.get() or 0)
-        except ValueError:
-            service_fee = 0
+        service_fee = float(b.get("service_fee") or 0)  # luôn lấy từ DB, không nhập tay
         nights = inv_srv.calc_nights(b["checkin_date"], b["checkout_date"])
         total = inv_srv.calc_total(b["price"], nights, late_fee, service_fee)
         self.var_total.set(f"{total:,.0f}")
@@ -384,7 +380,6 @@ class InvoiceFrame(tk.Frame):
             return
         try:
             total = float(self.var_total.get().replace(",", ""))
-            service_fee = float(self.var_service.get() or 0)
             status_code = STATUS_LABELS_VI_REV.get(self.cbo_status.get(), "Unpaid")
             payment_code = PAYMENT_LABELS_VI_REV.get(self.cbo_payment.get(), "Cash")
             new_id = inv_srv.create_invoice(
@@ -392,7 +387,6 @@ class InvoiceFrame(tk.Frame):
                 amount=total,
                 payment_method=payment_code,
                 status=status_code,
-                service_fee=service_fee,
             )
             messagebox.showinfo("Thành công", f"Đã tạo hóa đơn #{new_id}.")
             self.on_clear()
@@ -413,17 +407,15 @@ class InvoiceFrame(tk.Frame):
             return
         try:
             total = float(self.var_total.get().replace(",", ""))
-            service_fee = float(self.var_service.get() or 0)
             status_code = STATUS_LABELS_VI_REV.get(self.cbo_status.get(), "Unpaid")
             payment_code = PAYMENT_LABELS_VI_REV.get(self.cbo_payment.get(), "Cash")
-            # amount = tổng tiền ĐANG hiển thị (đã tính theo giá phòng hiện tại) ->
+            # amount = tổng tiền ĐANG hiển thị (đã tính theo giá phòng + phí dịch vụ hiện tại) ->
             # nếu status_code là 'Paid', số này sẽ được chốt cứng vĩnh viễn từ đây.
             inv_srv.update_invoice(
                 self.current_invoice_id,
                 amount=total,
                 status=status_code,
                 payment_method=payment_code,
-                service_fee=service_fee,
             )
             messagebox.showinfo("Thành công", "Đã cập nhật hóa đơn.")
             self.refresh_table()
